@@ -11,8 +11,9 @@ A compiled single-binary daemon that turns a VPS into a full development environ
 ### Runtime
 
 - **Bun** — single compiled binary via `bun build --compile`
-- **Single package** — backend and frontend in one `package.json`, Bun serves the built Svelte assets
+- **Single package** — backend and frontend in one `package.json`, Bun serves the built React assets
 - **Process supervisor model** — the daemon is a thin HTTP server + process manager. AI agent sessions, terminal PTYs, and cron jobs are managed child processes
+- **Graceful shutdown** — on `SIGTERM`, finish the current LLM streaming response, persist to SQLite, then exit. Active terminals and agent sessions are accepted losses on restart for v1.
 
 ### AI stack
 
@@ -35,7 +36,7 @@ Reused directly from `@mariozechner/pi-coding-agent` — fully decoupled from th
 - **read** — file reading with image support
 - **write** — file creation/writing
 - **edit** — text replacement with fuzzy matching
-- **bash** — shell command execution with streaming
+- **bash** — shell command execution with streaming (default 2-minute timeout, configurable, two-stage kill: SIGTERM then SIGKILL)
 - **grep** — pattern search via ripgrep
 - **find** — glob matching via fd
 - **ls** — directory listing
@@ -50,46 +51,56 @@ Additional tools built for shed:
 
 Uses pi's skill system directly — same SKILL.md format (Agent Skills standard), same directories (`~/.pi/agent/skills/` and `.pi/skills/`). Skills built for pi work in shed with zero changes. MCP support deferred — skills first.
 
+### Data model: Two-layer sync
+
+Two distinct data transport layers:
+
+1. **Chat streaming** — direct WebSocket stream for live agent messages and tool calls. Token-by-token, low-latency. This is the real-time path.
+2. **Sync layer (TanStack DB)** — everything else: conversation list, file states, agent tree, subagent statuses, schedules, settings. The UI reads from a local replica via TanStack DB, feels instant on interaction, syncs with the server's SQLite in the background.
+
+**Seam between layers:** Streaming writes to a client-side buffer the UI renders from. On persist, the sync layer delivers the canonical row. The client reconciles by ID — if it already has the message from streaming, it swaps in the synced version silently. Scrolling back to old conversations loads purely from the sync layer.
+
 ## Web UI
 
 ### Framework
 
-Svelte. Built assets served directly by Bun.
+React + Vite. No SSR — single-user app behind auth. Built assets served directly by Bun. TanStack DB for reactive state synchronization.
 
 ### Layout: Tabbed workspace
 
 - **Tab bar** — open multiple tabs, one visible at a time. Split panes deferred to later.
 - **Tab types:**
   - **Chat** — conversation with an agent
-  - **Terminal** — interactive shell (xterm.js + Bun.Terminal over WebSocket)
-  - **Editor** — CodeMirror, editable, save writes to disk
+  - **Terminal** — interactive shell (xterm.js + Bun PTY over WebSocket)
+  - **Editor** — CodeMirror, editable, save writes to disk. LSP support deferred to v2.
   - **Settings** — OAuth logins, API key entry, default model, subagent cap, schedules, system prompt
 
 ### Chat layout: Two columns
 
 When a chat tab is active:
 
-- **Left: Conversation pane** — pure conversation. User messages and agent text responses. Tool calls do NOT appear here — the chat stays clean.
-- **Right: Workspace panel** — always visible. Shows what the agent is doing and has touched:
-  - **Files section** — files touched this conversation, last action (read/edited/created), diff indicators, click to open in editor tab. Currently active files pulse/highlight.
-  - **Commands section** — recent shell commands, exit status, expandable output. Running commands show a spinner.
-  - **Agent tree** — tree view of the current agent and its subagents:
+- **Left: Conversation pane** — user messages, agent text responses, and **inline collapsed tool calls**. Tool calls appear as minimal one-line summaries (e.g., `read auth.ts`, `bash: npm test`) that can be expanded to see full input/output. The chat stream stays clean but the narrative stays coherent — the user doesn't have to cross-reference a separate panel to follow the agent's reasoning.
+- **Right: Workspace sidebar** — persistent state summary, slim by design:
+  - **Agent tree** — tree view of the current agent and its subagents with status indicators and one-line status per node (e.g., "running — editing auth.ts", "done — 3 files changed"). Unread/activity badges on nodes with new messages or completions. Clicking a subagent swaps the chat pane to show that subagent's conversation. Breadcrumb navigation to go back up: `Main Agent > Fix auth tests`.
     ```
     > Main Agent (active)
-      |- files, commands...
-      |- > Subagent: "Fix auth tests" (active)
+      |- > Subagent: "Fix auth tests" (active) •
       |- > Subagent: "Update docs" (active)
-      |- > Subagent: "Refactor utils" (done, collapsed)
+      |- > Subagent: "Refactor utils" (done, 3 files)
     ```
-    Clicking a subagent swaps the chat pane to show that subagent's conversation. The workspace panel updates to reflect that subagent's context. Breadcrumb navigation to go back up: `Main Agent > Fix auth tests`.
+  - **Files section** — files touched this conversation, last action (read/edited/created), diff indicators, click to open in editor tab.
 
-### Tool call display
+### Background streaming
 
-Tool calls appear only in the workspace panel, never in the chat stream. The chat contains the agent's reasoning and conclusions. The workspace panel shows the work.
+All agent WebSocket connections stay alive regardless of which agent is currently viewed. Switching between agents in the UI is instant — no loading state, the messages are already buffered.
 
 ### Model selection
 
 Per-tab dropdown in the chat tab header. Each conversation can use a different model. Default model configurable in settings.
+
+### Token counter
+
+Running token usage and estimated cost displayed per conversation in the chat header. No enforcement — purely for user awareness.
 
 ## Subagents
 
@@ -101,11 +112,17 @@ The main agent has a `spawn_subagent` tool. Parameters:
 
 ### Concurrency
 
-Configurable cap, default 5 concurrent subagents. Jobs beyond the cap queue with a semaphore.
+Configurable advisory cap, default 5 concurrent subagents. Jobs beyond the cap queue with a semaphore. Warning shown when cap is reached, not a hard block.
 
 ### Depth
 
 Arbitrary depth — subagents can spawn their own subagents. Data model is a tree (each agent has a `parentId`). UI handles one level well for v1; deeper nesting renders in the tree but without special UX treatment.
+
+### Guardrails
+
+- **Doom loop detection** — if the same tool call repeats 3 times consecutively, the agent pauses and flags it to the user before continuing.
+- **Bash timeout** — 2-minute default, configurable per-command. Two-stage kill (SIGTERM → SIGKILL).
+- No hard token/cost budgets — the token counter in the UI provides visibility, the user decides when to stop.
 
 ## Persistence
 
@@ -115,6 +132,8 @@ Arbitrary depth — subagents can spawn their own subagents. Data model is a tre
 - **messages** — id, conversation_id, role, content (JSON), timestamp
 
 Full `AgentMessage[]` stored as JSON — already serializable from pi-agent-core.
+
+**Conversation list** shows only top-level conversations (`parent_agent_id IS NULL`). Subagent conversations are accessed through the agent tree within their parent. Deleting a parent conversation cascade-deletes all subagent conversations.
 
 ## Provider auth
 
@@ -131,17 +150,16 @@ Reads from pi's `~/.pi/agent/auth.json` as well — if you've already logged in 
 
 ## Scheduled agents
 
-### Three ways to create:
+### Two ways to create:
 
-1. **Config file** — JSON file as source of truth, easy to version control
-2. **Settings UI** — create/edit/delete from a schedules section
-3. **Conversationally** — tell the agent "create a scheduled job to check API health every 6 hours" via the `manage_schedule` tool
+1. **Settings UI** — create/edit/delete from a schedules section
+2. **Conversationally** — tell the agent "create a scheduled job to check API health every 6 hours" via the `manage_schedule` tool. Chat is the primary interface for managing schedules.
 
-All three write to the same backing store.
+**Config file seed:** A JSON config file can be used to bootstrap initial schedules on first boot. Shed reads it, imports jobs into SQLite, then the config file is not consulted again unless the user runs `shed schedules import`. SQLite is the single source of truth.
 
 ### Execution
 
-Bun.CronJob runs scheduled agents. Each run creates a conversation tagged as "scheduled" with the job name. Appears in the conversation list with a badge — open it to see what the agent did.
+Bun.CronJob runs scheduled agents. Each run creates a conversation tagged as "scheduled" with the job name. Appears in the conversation list with a badge — open it to see what the agent did. Failed runs get a visual failure indicator (red badge) in the conversation list.
 
 ### Job definition
 
@@ -152,13 +170,42 @@ Bun.CronJob runs scheduled agents. Each run creates a conversation tagged as "sc
 
 ## Auth
 
-Simple token auth. `SHED_TOKEN` env var. On first visit, prompt for token, set HTTP-only cookie. Single-user tool.
+Simple token auth. `SHED_TOKEN` env var. On first visit, prompt for token, set cookie:
+- `HttpOnly; Secure; SameSite=Strict`
+- Configurable expiry, default 30 days
+- WebSocket upgrade requests must validate the cookie — `/ws/*` endpoints are not unprotected
+
+Single-user tool. `shed token rotate` CLI command generates a new token and invalidates the old cookie.
 
 ## System prompt
 
-Layered:
-- **Base layer** — shipped with shed. Instructs the agent on tool usage, safety, file operations. Not user-editable (unless they modify the source).
-- **User layer** — editable via a `system-prompt.md` file or through the settings UI. Appended on top of the base layer. Personality, project context, preferences.
+Layered, applied in order:
+1. **Base layer** — shipped with shed. Instructs the agent on tool usage, safety, file operations. Not user-editable (unless they modify the source).
+2. **User layer** — editable via a `system-prompt.md` file or through the settings UI. Global, applied to all conversations.
+3. **Per-conversation context** — optional override when starting a new conversation, appended for that conversation only. Covers "different projects need different context" without a full template system.
+4. **Active skills** — skill instructions appended last.
+
+## Terminal
+
+Uses `Bun.spawn` with the `terminal` option for full interactive PTY support:
+
+```typescript
+const proc = Bun.spawn(["bash", "-i"], {
+  terminal: {
+    cols: 80,
+    rows: 24,
+    data(term, data) { /* send to xterm.js via WebSocket */ },
+    exit(term, code, signal) { /* cleanup */ },
+  },
+});
+
+// Resize from xterm.js client
+proc.terminal.resize(newCols, newRows);  // sends SIGWINCH
+```
+
+**Known issue:** Ctrl+C (`\x03`) bypasses the kernel's line discipline (Bun issue #25779). Workaround: intercept `\x03` in writes and manually send `proc.kill('SIGINT')`. A "Send SIGINT" button in the terminal UI provides an additional escape hatch.
+
+**Note:** node-pty does not work under Bun (onData never fires, issue #25822). No fallback — Bun's native PTY is the only path.
 
 ## Data storage
 
@@ -172,15 +219,24 @@ All shed data lives in `~/.config/shed/`:
   bin/             # auto-downloaded rg, fd
 ```
 
+## Observability
+
+- **Logs** — structured JSON to stdout. Captured by systemd/journald or whatever process manager runs shed.
+- **Scheduled run failures** — visible in conversation list with failure badge. No external alerting for v1.
+
 ## Deployment
 
 ### Build
 
 `bun build --compile` produces a single executable.
 
+### Install
+
+GitHub releases with a one-liner curl install script. `shed update` CLI command pulls the latest release binary and restarts the daemon.
+
 ### Run
 
-Download binary, run it. First run auto-downloads rg/fd to `~/.config/shed/bin/`.
+Download binary, run it. First run auto-downloads rg/fd to `~/.config/shed/bin/`. If rg/fd download fails (air-gapped VPS), shed reports a clear error telling the user to install them manually.
 
 ### Network
 
@@ -191,8 +247,10 @@ Shed binds to `localhost:3000` by default (configurable via `SHED_HOST` and `SHE
 ## WebSocket protocol
 
 One WebSocket per tab:
-- `/ws/chat/:conversationId` — chat streaming
+- `/ws/chat/:conversationId` — chat streaming (direct, low-latency)
 - `/ws/terminal/:id` — PTY I/O
+
+All other UI state synced via TanStack DB (not per-tab WebSockets).
 
 ## Non-goals for v1
 
@@ -202,3 +260,7 @@ One WebSocket per tab:
 - Multi-user / team features
 - File syncing / local-remote split
 - Fancy subagent deep-nesting UX (tree renders, but no special treatment beyond one level)
+- LSP / language server integration (v2)
+- Session recovery on daemon restart
+- External alerting (webhook/email on failures)
+- Hard token/cost budgets (visibility only)
